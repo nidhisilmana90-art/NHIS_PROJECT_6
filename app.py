@@ -1,54 +1,45 @@
-"""
-Task 3 — Serving predictions on a web interface.
+"""Streamlit deployment for the Rossmann sales forecast model."""
 
-Run locally with:
-    pip install flask pandas numpy scikit-learn joblib matplotlib
-    python app.py
-then open http://127.0.0.1:5000
-
-Expects a serialized pipeline produced by 02_modeling.py, e.g.
-    model-14-07-2026-01-00-39-00.pkl
-placed in the same folder as this file (or point MODEL_PATH at it).
-"""
-import io
 import glob
-import base64
-import logging
+import os
+
+import joblib
+import matplotlib
 import numpy as np
 import pandas as pd
-import matplotlib
+import streamlit as st
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import joblib
-from flask import Flask, render_template, request, send_file, jsonify
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("rossmann_app")
-
-app = Flask(__name__)
-
-# ---------------------------------------------------------------
-# Load the most recently serialized model at startup
-# ---------------------------------------------------------------
-MODEL_CANDIDATES = sorted(glob.glob("model-*.pkl")) or sorted(glob.glob("../model-*.pkl"))
-if not MODEL_CANDIDATES:
-    raise FileNotFoundError(
-        "No model-*.pkl found. Run 02_modeling.py first, or copy the .pkl file next to app.py."
-    )
-MODEL_PATH = MODEL_CANDIDATES[-1]
-bundle = joblib.load(MODEL_PATH)
-pipeline = bundle["pipeline"]
-NUM_FEATURES = bundle["num_features"]
-CAT_FEATURES = bundle["cat_features"]
-logger.info(f"Loaded model: {MODEL_PATH}")
 
 STATE_HOLIDAY_MAP = {"0": 0, "a": 1, "b": 2, "c": 3}
 
 
+@st.cache_resource
+def load_model_bundle():
+    """Load the newest serialized model artifact."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = sorted(glob.glob(os.path.join(base_dir, "model-*.pkl")))
+    if not candidates:
+        raise FileNotFoundError(
+            "No model-*.pkl found in the project directory. Place the trained model next to app.py."
+        )
+    model_path = candidates[-1]
+    bundle = joblib.load(model_path)
+    return model_path, bundle["pipeline"], bundle["num_features"], bundle["cat_features"]
+
+
+MODEL_PATH, pipeline, NUM_FEATURES, CAT_FEATURES = load_model_bundle()
+
+
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Mirrors the feature engineering used at training time (see 02_modeling.py)."""
+    """Mirror the feature engineering used during training."""
     df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"])
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+    else:
+        raise ValueError("The input dataframe must contain a 'Date' column.")
+
     df["StateHoliday"] = df.get("StateHoliday", "0").astype(str)
     df["StateHolidayCode"] = df["StateHoliday"].map(STATE_HOLIDAY_MAP).fillna(0).astype(int)
 
@@ -62,8 +53,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["IsMonthMid"] = ((df["Day"] > 10) & (df["Day"] <= 20)).astype(int)
     df["IsMonthEnd"] = (df["Day"] > 20).astype(int)
 
-    df["DaysToHoliday"] = df.get("DaysToHoliday", 0)
-    df["DaysAfterHoliday"] = df.get("DaysAfterHoliday", 0)
+    df["DaysToHoliday"] = pd.to_numeric(df.get("DaysToHoliday", 0), errors="coerce").fillna(0)
+    df["DaysAfterHoliday"] = pd.to_numeric(df.get("DaysAfterHoliday", 0), errors="coerce").fillna(0)
 
     def col_or_default(name, default):
         if name in df.columns:
@@ -71,17 +62,17 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         return pd.Series(default, index=df.index)
 
     df["CompetitionDistanceLog"] = np.log1p(col_or_default("CompetitionDistance", 1000))
-    df["CompetitionOpenMonths"] = col_or_default("CompetitionOpenMonths", 12)
-    df["HasCompetition"] = col_or_default("HasCompetition", 1)
+    df["CompetitionOpenMonths"] = pd.to_numeric(col_or_default("CompetitionOpenMonths", 12), errors="coerce").fillna(12)
+    df["HasCompetition"] = pd.to_numeric(col_or_default("HasCompetition", 1), errors="coerce").fillna(1)
 
-    df["Promo2"] = col_or_default("Promo2", 0)
-    df["IsPromo2Active"] = col_or_default("IsPromo2Active", 0)
-    df["IsPromo2Month"] = col_or_default("IsPromo2Month", 0)
+    df["Promo2"] = pd.to_numeric(col_or_default("Promo2", 0), errors="coerce").fillna(0)
+    df["IsPromo2Active"] = pd.to_numeric(col_or_default("IsPromo2Active", 0), errors="coerce").fillna(0)
+    df["IsPromo2Month"] = pd.to_numeric(col_or_default("IsPromo2Month", 0), errors="coerce").fillna(0)
 
     df["StoreType"] = col_or_default("StoreType", "a")
     df["Assortment"] = col_or_default("Assortment", "a")
-    df["SchoolHoliday"] = col_or_default("SchoolHoliday", 0)
-    df["Promo"] = col_or_default("Promo", 0)
+    df["SchoolHoliday"] = pd.to_numeric(col_or_default("SchoolHoliday", 0), errors="coerce").fillna(0)
+    df["Promo"] = pd.to_numeric(col_or_default("Promo", 0), errors="coerce").fillna(0)
     return df
 
 
@@ -90,70 +81,144 @@ def predict(df: pd.DataFrame) -> pd.DataFrame:
     X = fe[NUM_FEATURES + CAT_FEATURES]
     preds = pipeline.predict(X)
     fe["PredictedSales"] = preds.round(2)
-    # rough customer estimate from the historical sales/customer ratio (~8.8)
     fe["PredictedCustomers"] = (fe["PredictedSales"] / 8.8).round(0)
     return fe
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template("index.html")
+st.set_page_config(page_title="Rossmann Sales Forecast", page_icon="📈", layout="wide")
+st.title("Rossmann Sales Forecast")
+st.caption(f"Model loaded from: {os.path.basename(MODEL_PATH)}")
 
+with st.sidebar:
+    st.header("Forecast settings")
+    store_id = st.number_input("Store ID", min_value=1, max_value=1115, value=1, step=1)
+    start_date = st.date_input("Start date", value=pd.Timestamp.today().date() - pd.Timedelta(days=14))
+    end_date = st.date_input("End date", value=pd.Timestamp.today().date())
+    promo = st.checkbox("Promo active", value=True)
+    school_holiday = st.checkbox("School holiday", value=False)
+    generate_button = st.button("Generate forecast")
 
-@app.route("/predict_form", methods=["POST"])
-def predict_form():
-    """Single-store, date-range prediction from the HTML form."""
-    store_id = int(request.form["store_id"])
-    start_date = request.form["start_date"]
-    end_date = request.form["end_date"]
-    promo = int(request.form.get("promo", 0))
-    school_holiday = int(request.form.get("school_holiday", 0))
+uploaded_file = st.file_uploader("Upload a CSV for bulk predictions", type=["csv"], help="CSV should include Date and Store columns, with optional Promo and SchoolHoliday columns.")
 
-    dates = pd.date_range(start_date, end_date, freq="D")
-    df = pd.DataFrame({
-        "Store": store_id,
-        "Date": dates,
-        "Promo": promo,
-        "SchoolHoliday": school_holiday,
-        "StateHoliday": "0",
-    })
-    result = predict(df)
+if generate_button:
+    if end_date < start_date:
+        st.warning("The end date must be after the start date.")
+    else:
+        dates = pd.date_range(start_date, end_date, freq="D")
+        df = pd.DataFrame(
+            {
+                "Store": store_id,
+                "Date": dates,
+                "Promo": int(promo),
+                "SchoolHoliday": int(school_holiday),
+                "StateHoliday": "0",
+            }
+        )
+        result = predict(df)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(result["Date"], result["PredictedSales"], marker="o", color="#2b8cbe")
-    ax.set_title(f"Predicted sales — Store {store_id}")
-    ax.set_ylabel("Sales")
-    fig.autofmt_xdate()
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=110)
-    plt.close()
-    chart_b64 = base64.b64encode(buf.getvalue()).decode()
+        st.subheader(f"Forecast for Store {store_id}")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(result["Date"], result["PredictedSales"], marker="o", color="#2b8cbe")
+        ax.set_title(f"Predicted Sales — Store {store_id}")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Sales")
+        fig.autofmt_xdate()
+        st.pyplot(fig)
 
-    table = result[["Date", "PredictedSales", "PredictedCustomers"]].to_dict(orient="records")
-    csv_data = result[["Date", "PredictedSales", "PredictedCustomers"]].to_csv(index=False)
+        table = result[["Date", "PredictedSales", "PredictedCustomers"]].copy()
+        table["Date"] = table["Date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(table.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}), use_container_width=True)
 
-    return render_template("index.html", chart=chart_b64, table=table, csv_data=csv_data)
+        csv_data = table.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}).to_csv(index=False)
+        st.download_button(
+            "Download forecast CSV",
+            csv_data,
+            file_name=f"sales_forecast_store_{store_id}.csv",
+            mime="text/csv",
+        )
 
+if uploaded_file is not None:
+    try:
+        input_df = pd.read_csv(uploaded_file)
+        if "Date" not in input_df.columns:
+            st.error("The uploaded CSV must contain a 'Date' column.")
+        else:
+            result = predict(input_df)
+            st.subheader("Bulk prediction results")
+            display_df = result[["Date", "PredictedSales", "PredictedCustomers"]].copy()
+            display_df["Date"] = display_df["Date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(display_df.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}), use_container_width=True)
+            st.download_button(
+                "Download full predictions",
+                display_df.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}).to_csv(index=False),
+                file_name="bulk_predictions.csv",
+                mime="text/csv",
+            )
+    except Exception as exc:
+        st.error(f"Could not process the uploaded CSV: {exc}")
 
-@app.route("/predict_csv", methods=["POST"])
-def predict_csv():
-    """Bulk prediction from an uploaded CSV (Date, Store, IsHoliday, IsWeekend, IsPromo, ...)."""
-    file = request.files["csv_file"]
-    df = pd.read_csv(file)
-    rename = {"IsHoliday": "StateHoliday", "IsPromo": "Promo"}
-    df = df.rename(columns=rename)
-    result = predict(df)
-    out = io.StringIO()
-    result.to_csv(out, index=False)
-    out.seek(0)
-    return send_file(
-        io.BytesIO(out.getvalue().encode()),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="predictions.csv",
-    )
+if not generate_button and uploaded_file is None:
+    st.info("Use the sidebar to generate a daily sales forecast for a store, or upload a CSV file with dates to run bulk prediction.")
 
+uploaded_file = st.file_uploader("Upload a CSV for bulk predictions", type=["csv"], help="CSV should include Date and Store columns, with optional Promo and SchoolHoliday columns.")
 
-if __name__ == "__main__":
-    app.run(debug=True)
+if generate_button:
+    if end_date < start_date:
+        st.warning("The end date must be after the start date.")
+    else:
+        dates = pd.date_range(start_date, end_date, freq="D")
+        df = pd.DataFrame(
+            {
+                "Store": store_id,
+                "Date": dates,
+                "Promo": int(promo),
+                "SchoolHoliday": int(school_holiday),
+                "StateHoliday": "0",
+            }
+        )
+        result = predict(df)
+
+        st.subheader(f"Forecast for Store {store_id}")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(result["Date"], result["PredictedSales"], marker="o", color="#2b8cbe")
+        ax.set_title(f"Predicted Sales — Store {store_id}")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Sales")
+        fig.autofmt_xdate()
+        st.pyplot(fig)
+
+        table = result[["Date", "PredictedSales", "PredictedCustomers"]].copy()
+        table["Date"] = table["Date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(table.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}), use_container_width=True)
+
+        csv_data = table.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}).to_csv(index=False)
+        st.download_button(
+            "Download forecast CSV",
+            csv_data,
+            file_name=f"sales_forecast_store_{store_id}.csv",
+            mime="text/csv",
+        )
+
+if uploaded_file is not None:
+    try:
+        input_df = pd.read_csv(uploaded_file)
+        if "Date" not in input_df.columns:
+            st.error("The uploaded CSV must contain a 'Date' column.")
+        else:
+            result = predict(input_df)
+            st.subheader("Bulk prediction results")
+            display_df = result[["Date", "PredictedSales", "PredictedCustomers"]].copy()
+            display_df["Date"] = display_df["Date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(display_df.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}), use_container_width=True)
+            st.download_button(
+                "Download full predictions",
+                display_df.rename(columns={"PredictedSales": "Sales", "PredictedCustomers": "Customers"}).to_csv(index=False),
+                file_name="bulk_predictions.csv",
+                mime="text/csv",
+            )
+    except Exception as exc:
+        st.error(f"Could not process the uploaded CSV: {exc}")
+
+if not generate_button and uploaded_file is None:
+    st.info("Use the sidebar to generate a daily sales forecast for a store, or upload a CSV file with dates to run bulk prediction.")
+>>>>>>> 05db47d (Initial Streamlit deploy commit)
